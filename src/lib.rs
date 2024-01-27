@@ -2,33 +2,154 @@ use std::{
 	collections::HashMap,
 	fs::Permissions,
 	io::Read,
+	ops::{Deref, DerefMut},
 	os::unix::fs::PermissionsExt,
 	path::PathBuf,
-	process::{Child, Command, ExitStatus, Stdio},
+	process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
 	str::FromStr,
-	sync::Arc,
+	sync::{Arc, RwLock},
 };
 
-use egui_node_graph::{Graph, InputId, NodeId, OutputId};
+use eframe::{
+	egui::{Response, ScrollArea, Ui},
+	epaint::Color32,
+};
+use egui_node_graph::{
+	DataTypeTrait, Graph, GraphEditorState, GraphNodeWidget, InputId, NodeDataTrait, NodeId,
+	NodeResponse, NodeTemplateIter, NodeTemplateTrait, OutputId, UserResponseTrait,
+	WidgetValueTrait,
+};
+use nonblock::NonBlockingReader;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone)]
+pub struct UserResponse(pub Response);
+
+impl UserResponseTrait for UserResponse {}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct NodeTemplate;
+
+impl NodeTemplateTrait for NodeTemplate {
+	type NodeData = Node;
+
+	type DataType = PipeKind;
+
+	type ValueType = NoValues;
+
+	type UserState = ProjectInner;
+
+	fn node_finder_label(&self, user_state: &mut Self::UserState) -> std::borrow::Cow<str> {
+		std::borrow::Cow::Borrowed("Script")
+	}
+
+	fn node_graph_label(&self, user_state: &mut Self::UserState) -> String {
+		String::from("Script")
+	}
+
+	fn user_data(&self, user_state: &mut Self::UserState) -> Self::NodeData {
+		Node {
+			script: Default::default(),
+		}
+	}
+
+	fn build_node(
+		&self,
+		graph: &mut Graph<Self::NodeData, Self::DataType, Self::ValueType>,
+		user_state: &mut Self::UserState,
+		node_id: NodeId,
+	) {
+		// TODO do this
+	}
+}
+
+impl NodeTemplateIter for NodeTemplate {
+	type Item = Self;
+
+	fn all_kinds(&self) -> Vec<Self::Item> {
+		vec![Self]
+	}
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Copy)]
+pub struct NoValues;
+
+impl WidgetValueTrait for NoValues {
+	type Response = UserResponse;
+
+	type UserState = ProjectInner;
+
+	type NodeData = Node;
+
+	fn value_widget(
+		&mut self,
+		param_name: &str,
+		node_id: NodeId,
+		ui: &mut Ui,
+		user_state: &mut Self::UserState,
+		node_data: &Self::NodeData,
+	) -> Vec<Self::Response> {
+		vec![UserResponse(ui.label("Should never appear"))]
+	}
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Project {
-	pub graph: Graph<Node, PipeKind, ()>,
+	#[serde(rename = "graph_state")]
+	pub graph_editor: GraphEditorState<Node, PipeKind, NoValues, NodeTemplate, ProjectInner>,
+	#[serde(flatten)]
+	pub inner: ProjectInner,
+}
+
+impl Clone for Project {
+	fn clone(&self) -> Self {
+		Self {
+			graph_editor: self.graph_editor.clone(),
+			inner: Default::default(),
+		}
+	}
+}
+
+impl Deref for Project {
+	type Target = ProjectInner;
+
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl DerefMut for Project {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.inner
+	}
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct ProjectInner {
 	#[serde(skip)]
 	pub processes: HashMap<NodeId, Process>,
 	#[serde(skip)]
 	pub graves: HashMap<NodeId, ExitStatus>,
-	pub output: HashMap<NodeId, (String, String)>,
+	pub output: HashMap<NodeId, (Vec<u8>, Vec<u8>)>,
+}
+
+impl Clone for ProjectInner {
+	fn clone(&self) -> Self {
+		Self::default()
+	}
 }
 
 impl Project {
+	pub fn graph(&self) -> &Graph<Node, PipeKind, NoValues> {
+		&self.graph_editor.graph
+	}
+
 	pub fn start(&mut self) {
 		self.graves.clear();
 		self.output.clear();
 		let (inputs, outputs) = self
-			.graph
+			.graph()
 			.iter_connections()
 			.map(|(input, output)| ((input, output), Arc::new(Pipe::default())))
 			.fold(
@@ -43,9 +164,9 @@ impl Project {
 				},
 			);
 		let scripts: HashMap<NodeId, Arc<Script>> = self
-			.graph
+			.graph()
 			.iter_nodes()
-			.filter_map(|node| self.graph.nodes.get(node))
+			.filter_map(|node| self.graph().nodes.get(node))
 			.map(|node| (node.id, Arc::new((&node.user_data).into())))
 			.collect();
 
@@ -60,7 +181,7 @@ impl Project {
 		> = scripts
 			.into_iter()
 			.map(|(id, script)| {
-				let node = self.graph.nodes.get(id).unwrap();
+				let node = self.graph().nodes.get(id).unwrap();
 				let inputs: HashMap<_, _> = node
 					.inputs
 					.iter()
@@ -108,12 +229,14 @@ impl Project {
 					pipes.append(&mut pipes_);
 					command.env(key, value);
 				}
-				let child = command.spawn().expect("Spawn failure");
+				let mut child = dbg!(command).spawn().expect("Spawn failure");
 				(
 					id,
 					Process {
 						script,
 						pipes,
+						stdout: NonBlockingReader::from_fd(child.stdout.take().unwrap()).unwrap(),
+						stderr: NonBlockingReader::from_fd(child.stderr.take().unwrap()).unwrap(),
 						child,
 					},
 				)
@@ -131,12 +254,8 @@ impl Project {
 			.into_iter()
 			.filter_map(|(id, mut process)| {
 				let (output, error) = self.output.entry(id).or_default();
-				if let Some(stdout) = &mut process.child.stdout {
-					stdout.read_to_string(output).expect("Read failure");
-				}
-				if let Some(stderr) = &mut process.child.stderr {
-					stderr.read_to_string(error).expect("Read failure");
-				}
+				process.stdout.read_available(output).expect("Read failure");
+				process.stderr.read_available(error).expect("Read failure");
 				if let Some(status) = process.child.try_wait().expect("Wait failure") {
 					self.graves.insert(id, status);
 					None
@@ -150,25 +269,108 @@ impl Project {
 
 #[derive(Serialize, Deserialize)]
 pub struct Node {
-	pub script: String,
+	pub script: RwLock<String>,
 }
+
 impl From<&Node> for Script {
 	fn from(value: &Node) -> Self {
-		Script::from(value.script.as_str())
+		Script::from(value.script.read().unwrap().as_str())
 	}
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+impl Clone for Node {
+	fn clone(&self) -> Self {
+		Self {
+			script: self.script.read().unwrap().to_string().into(),
+		}
+	}
+}
+
+impl NodeDataTrait for Node {
+	type Response = UserResponse;
+
+	type UserState = ProjectInner;
+
+	type DataType = PipeKind;
+
+	type ValueType = NoValues;
+
+	fn bottom_ui(
+		&self,
+		ui: &mut eframe::egui::Ui,
+		node_id: NodeId,
+		graph: &Graph<Self, Self::DataType, Self::ValueType>,
+		user_state: &mut Self::UserState,
+	) -> Vec<egui_node_graph::NodeResponse<Self::Response, Self>>
+	where
+		Self::Response: egui_node_graph::UserResponseTrait,
+	{
+		let node = graph
+			.nodes
+			.get(node_id)
+			.expect("Tried to render missing node");
+		let output = user_state.output.get(&node_id);
+		let grave = user_state.graves.get(&node_id);
+		vec![NodeResponse::User(UserResponse(
+			ui.vertical(|ui| {
+				ui.text_edit_multiline(&mut *node.user_data.script.write().unwrap());
+				if let Some(status) = grave {
+					ui.label(format!("STATUS: {status}"));
+				}
+				if let Some((stdout, stderr)) = output {
+					ui.label("STDOUT:");
+					ScrollArea::new([false, true])
+						.id_source(("stdout", node_id))
+						.auto_shrink([false, false])
+						.max_height(150.0)
+						.max_width(150.0)
+						.show(ui, |ui| {
+							ui.label(String::from_utf8_lossy(stdout));
+						});
+					ui.label("STDERR:");
+					ScrollArea::new([false, true])
+						.id_source(("stderr", node_id))
+						.auto_shrink([false, false])
+						.max_height(150.0)
+						.max_width(150.0)
+						.show(ui, |ui| {
+							ui.label(String::from_utf8_lossy(stderr));
+						});
+				}
+				if user_state.processes.contains_key(&node_id) {
+					ui.spinner();
+				}
+			})
+			.response,
+		))]
+	}
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 pub enum PipeKind {
 	Single,
 	Many,
 }
 
-#[derive(Debug)]
+impl DataTypeTrait<ProjectInner> for PipeKind {
+	fn data_type_color(&self, _user_state: &mut ProjectInner) -> eframe::egui::Color32 {
+		match self {
+			PipeKind::Single => Color32::GREEN,
+			PipeKind::Many => Color32::DARK_GREEN,
+		}
+	}
+
+	fn name(&self) -> std::borrow::Cow<str> {
+		todo!()
+	}
+}
+
 pub struct Process {
 	pub script: Arc<Script>,
 	pub pipes: Vec<Arc<Pipe>>,
 	pub child: Child,
+	pub stdout: NonBlockingReader<ChildStdout>,
+	pub stderr: NonBlockingReader<ChildStderr>,
 }
 
 #[derive(Debug)]
@@ -186,6 +388,7 @@ impl From<&str> for Script {
 }
 impl Drop for Script {
 	fn drop(&mut self) {
+		println!("Dropping script!");
 		std::fs::remove_file(&self.0).expect("Cleanup failure");
 	}
 }
@@ -212,7 +415,7 @@ impl Drop for Pipe {
 fn test_basic_graph() {
 	let mut project = Project::default();
 
-	let emitter = project.graph.add_node(
+	let emitter = project.graph().add_node(
 		"Node 1".to_string(),
 		Node {
 			script: "#!/usr/bin/env bash
@@ -223,10 +426,10 @@ fn test_basic_graph() {
 		|graph, id| {},
 	);
 	let output = project
-		.graph
+		.graph()
 		.add_output_param(emitter, "out".to_string(), PipeKind::Single);
 
-	let receiver = project.graph.add_node(
+	let receiver = project.graph().add_node(
 		"Node 2".to_string(),
 		Node {
 			script: "#!/usr/bin/env bash
@@ -237,7 +440,7 @@ fn test_basic_graph() {
 		},
 		|graph, id| {},
 	);
-	let input = project.graph.add_input_param(
+	let input = project.graph().add_input_param(
 		receiver,
 		"in".to_string(),
 		PipeKind::Single,
@@ -246,7 +449,7 @@ fn test_basic_graph() {
 		false,
 	);
 
-	project.graph.add_connection(output, input);
+	project.graph().add_connection(output, input);
 
 	project.start();
 	while !project.processes.is_empty() {
